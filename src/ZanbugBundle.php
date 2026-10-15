@@ -1,0 +1,104 @@
+<?php
+
+namespace Zanbug\Symfony;
+
+use Zanbug\Sdk\Zanbug;
+use Symfony\Component\HttpKernel\Bundle\Bundle;
+
+/**
+ * Zanbug Symfony bundle. Register in config/bundles.php:
+ *
+ *     Zanbug\Symfony\ZanbugBundle::class => ['all' => true],
+ */
+class ZanbugBundle extends Bundle
+{
+    /**
+     * boot() runs on every kernel boot (every request / CLI run), unlike the
+     * extension's load() which only runs when the container is (re)compiled and
+     * cached. We initialize the SDK here so the static client exists at runtime.
+     */
+    public function boot(): void
+    {
+        parent::boot();
+
+        if ($this->container !== null && $this->container->hasParameter('zanbug._config')) {
+            Zanbug::init($this->container->getParameter('zanbug._config'));
+            $this->registerQueryRunner();
+            $this->registerUserResolver();
+        }
+    }
+
+    /**
+     * Attach the logged-in user (any firewall) to every event automatically.
+     * The service is fetched lazily on first use, not on every boot.
+     */
+    private function registerUserResolver(): void
+    {
+        try {
+            if ($this->container === null || !method_exists('\\Zanbug\\Sdk\\Zanbug', 'setUserResolver')) {
+                return;
+            }
+            $container = $this->container;
+            Zanbug::setUserResolver(function () use ($container) {
+                if (!$container->has('zanbug.user_resolver')) {
+                    return null;
+                }
+                $resolver = $container->get('zanbug.user_resolver');
+                return is_callable($resolver) ? $resolver() : null;
+            });
+        } catch (\Throwable $e) {
+            // Monitoring must never break the app.
+        }
+    }
+
+    /**
+     * Let the Zanbug panel re-run one of this app's own captured SELECTs and
+     * report the timing. Uses Doctrine's connection inside a transaction that is
+     * always rolled back; only the row COUNT is returned, never row data.
+     */
+    private function registerQueryRunner(): void
+    {
+        try {
+            if ($this->container === null || !$this->container->has('doctrine.dbal.default_connection')) {
+                return;
+            }
+            $container = $this->container;
+            // The core SDK may be older than this adapter (stale lock file or a
+            // manual libs/ copy loaded first). Never call into it blindly.
+            if (!method_exists('\\Zanbug\\Sdk\\Zanbug', 'setQueryRunner')) {
+                return;
+            }
+
+            Zanbug::setQueryRunner(function ($sql, array $bindings, $returnRows = false) use ($container) {
+                $conn = $container->get('doctrine.dbal.default_connection');
+                $conn->beginTransaction();
+                try {
+                    // EXPLAIN needs column names, so ask for associative rows there.
+                    // DBAL 3/4 renamed the fetch methods; DBAL 2 has fetchAll().
+                    if ($returnRows) {
+                        $rows = method_exists($conn, 'fetchAllAssociative')
+                            ? $conn->fetchAllAssociative($sql, $bindings)
+                            : $conn->fetchAll($sql, $bindings);
+
+                        return is_array($rows) ? $rows : array();
+                    }
+                    $rows = method_exists($conn, 'fetchAllNumeric')
+                        ? $conn->fetchAllNumeric($sql, $bindings)
+                        : $conn->fetchAll($sql, $bindings);
+
+                    return is_array($rows) ? count($rows) : 0;
+                } finally {
+                    try {
+                        $conn->rollBack();
+                    } catch (\Exception $e) {
+                        // Nothing was written; a failed rollback is not fatal.
+                    }
+                }
+            });
+        } catch (\Exception $e) {
+            // Monitoring must never break the app.
+        } catch (\Throwable $e) {
+            // Same for engine errors.
+        }
+    }
+}
